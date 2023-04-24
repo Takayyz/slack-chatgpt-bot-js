@@ -34,6 +34,74 @@ const ACTIONS = {
 };
 
 /**
+ * スレッドの会話取得
+ */
+const getReplies = async (channel, threadTs, client) => {
+  const replies = await client.conversations.replies({
+    channel: channel,
+    ts: threadTs,
+  });
+
+  if (!replies.messages) {
+    throw new Error('[ERROR]:\nスレッドが見つかりませんでした。\n管理者に連絡してください。');
+  }
+
+  return replies;
+}
+
+/**
+ * スレッドの会話をOpenAI APIのリクエスト仕様にフォーマット
+ */
+const formatMessages = async (messages) => {
+  return messages.map((message) => {
+    return {
+      role: message.user === env.SLACK_BOT_MEMBER_ID ? 'assistant' : 'user',
+      content: (message.text || '').replace(`<@${env.SLACK_BOT_MEMBER_ID}>`, '').replace(`<@${message.user}> `, ''),
+    };
+  });
+}
+
+/**
+ * OpenAI API呼び出し
+ */
+const getAnswer = async (threadMessages) => {
+  const response = await axios.post(
+    env.OPENAI_API_URL,
+    {
+      model: env.OPENAI_API_MODEL,
+      messages: threadMessages,
+    },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      },
+    },
+  );
+  // TODO:fetchで試す
+  // const response = await fetch(
+  //   env.OPENAI_API_URL,
+  //   {
+  //     method: 'POST',
+  //     headers: {
+  //       'Content-Type': 'application/json',
+  //       Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+  //     },
+  //     body: {
+  //       model: env.OPENAI_API_MODEL,
+  //       messages: threadMessages,
+  //     },
+  //   },
+  // );
+
+  if (!response.data) {
+    throw new Error('[ERROR]:\n回答の取得に失敗しました。');
+  }
+
+  return response.data.choices[0].message.content;
+}
+
+/**
  * メンションイベントを受け付け
  */
 app.event('app_mention', async ({event, client, say}) => {
@@ -43,74 +111,19 @@ app.event('app_mention', async ({event, client, say}) => {
   const textWithoutMemberId = event.text.replace(`<@${env.SLACK_BOT_MEMBER_ID}>`, '');
   if (textWithoutMemberId.length > 0) {
     try {
-      // INFO: 該当スレッドの会話取得
-      const replies = await client.conversations.replies({
-        channel: event.channel,
-        ts: threadTs,
-      });
-
-      if (!replies.messages) {
-        await say({
-          thread_ts: threadTs,
-          text: '[ERROR]:\nスレッドが見つかりませんでした。\n管理者に連絡してください。'
-        });
-        return;
-      }
-
-      const threadMessages = replies.messages.map((message) => {
-        return {
-          role: message.user === env.SLACK_BOT_MEMBER_ID ? 'assistant' : 'user',
-          content: (message.text || '').replace(`<@${env.SLACK_BOT_MEMBER_ID}>`, '').replace(`<@${message.user}> `, ''),
-        };
-      });
-
-      // INFO: OpenAI API呼び出し
-      const response = await axios.post(
-        env.OPENAI_API_URL,
-        {
-          model: env.OPENAI_API_MODEL,
-          messages: threadMessages,
-        },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-          },
-        },
-      );
-      // TODO:fetchで試す
-      // const response = await fetch(
-      //   env.OPENAI_API_URL,
-      //   {
-      //     method: 'POST',
-      //     headers: {
-      //       'Content-Type': 'application/json',
-      //       Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-      //     },
-      //     body: {
-      //       model: env.OPENAI_API_MODEL,
-      //       messages: threadMessages,
-      //     },
-      //   },
-      // );
-
-      if (!response.data) {
-        await say({
-          thread_ts: threadTs,
-          text: '[WARNING]:\n回答の取得に失敗しました。',
-        });
-        return;
-      }
+      const replies = await getReplies(event.channel, threadTs, client);
+      const threadMessages = await formatMessages(replies.messages);
+      const answer = await getAnswer(threadMessages);
 
       await say({
         thread_ts: threadTs,
-        text: response.data.choices[0].message.content,
+        text: answer,
       });
       return;
     } catch (error) {
       await say({
         thread_ts: threadTs,
-        text: '[ERROR]:\nエラーが発生しました。\n管理者に連絡してください。'
+        text: error.message || '[ERROR]:\nエラーが発生しました。\n管理者に連絡してください。'
       });
       return;
     }
@@ -149,7 +162,7 @@ app.event('app_mention', async ({event, client, say}) => {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `<@${user}> 用件を選択してください。`,
+          text: `<@${event.user}> 用件を選択してください。`,
         },
       },
       {
@@ -157,7 +170,7 @@ app.event('app_mention', async ({event, client, say}) => {
         elements: actionButtons,
       },
     ],
-    text: `<@${user}> 用件を選択してください。`,
+    text: `<@${event.user}> 用件を選択してください。`,
   });
 });
 
@@ -182,59 +195,23 @@ app.action(ACTIONS.summarize.id, async ({body, client, ack, say}) => {
   const channelId = body.channel.id;
   const threadTs = body.container.thread_ts;
   try {
-    const replies = await client.conversations.replies({
-      channel: channelId,
-      ts: threadTs,
-    });
-
-    if (!replies.messages) {
-      await say('[ERROR]:\nスレッドが見つかりませんでした。\n管理者に連絡してください。');
-      return;
-    }
-
-    const threadMessages = replies.messages.map((message) => {
-      return {
-        role: message.user === env.SLACK_BOT_MEMBER_ID ? 'assistant' : 'user',
-        content: (message.text || '').replace(`<@${env.SLACK_BOT_MEMBER_ID}>`, '').replace(`<@${message.user}> `, ''),
-      };
-    });
+    const replies = await getReplies(channelId, threadTs, client);
+    const threadMessages = await formatMessages(replies.messages);
     threadMessages.push({
       role: 'user',
       content: 'このスレッドの内容を要約してください。',
     });
-
-    // INFO: OpenAI API呼び出し
-    const response = await axios.post(
-      env.OPENAI_API_URL,
-      {
-        model: env.OPENAI_API_MODEL,
-        messages: threadMessages,
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-        },
-      },
-    );
-
-    if (!response.data) {
-      await say({
-        thread_ts: threadTs,
-        text: '[WARNING]:\n回答の取得に失敗しました。',
-      });
-      return;
-    }
+    const answer = await getAnswer(threadMessages);
 
     await say({
       thread_ts: threadTs,
-      text: response.data.choices[0].message.content,
+      text: answer,
     });
     return;
   } catch (error) {
     await say({
       thread_ts: threadTs,
-      text: '[ERROR]:\nエラーが発生しました。\n管理者に連絡してください。'
+      text: error.message || '[ERROR]:\nエラーが発生しました。\n管理者に連絡してください。'
     });
     return;
   }
